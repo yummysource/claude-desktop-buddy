@@ -7,6 +7,49 @@
 
 M5Canvas spr = M5Canvas(&M5.Lcd);
 
+// ─── CJK rendering helpers ─────────────────────────────────────────────
+// On StickS3 we switch to efontCN_14 just before rendering any string
+// that may carry UTF-8 from the Claude app (promptTool, promptHint,
+// tama.msg, petName, ownerName, transcript lines) and switch back to
+// the default GLCD font for the rest of the UI so the ASCII-tuned
+// layouts (menu, info pages, clock) stay untouched. The classic
+// StickC Plus build doesn't have room for a CJK font in its 2MB app
+// partition, so these helpers are no-ops there — Chinese still won't
+// render on the classic board.
+#ifdef BUDDY_BOARD_S3
+static inline void useCjkFont()   { spr.setFont(&fonts::efontCN_14); }
+static inline void useAsciiFont() { spr.setFont(&fonts::Font0);       }
+#else
+static inline void useCjkFont()   {}
+static inline void useAsciiFont() {}
+#endif
+
+// Count visual columns in a UTF-8 string: ASCII = 1, multibyte = 2.
+// Stops at NUL or at `budget` columns, returns columns consumed and
+// writes the byte-offset of the first byte past the last full codepoint
+// it kept into *outBytes. Safe on malformed sequences (treats stray
+// bytes as single columns).
+static uint16_t utf8TakeCols(const char* s, uint16_t budget, uint16_t* outBytes) {
+  uint16_t cols = 0, bytes = 0;
+  while (s[bytes]) {
+    uint8_t b = (uint8_t)s[bytes];
+    uint8_t seq, w;
+    if (b < 0x80)       { seq = 1; w = 1; }   // ASCII
+    else if (b < 0xC0)  { seq = 1; w = 1; }   // stray continuation — keep as 1 col
+    else if (b < 0xE0)  { seq = 2; w = 2; }
+    else if (b < 0xF0)  { seq = 3; w = 2; }
+    else                { seq = 4; w = 2; }
+    if (cols + w > budget) break;
+    // refuse partial codepoint at end of string
+    bool full = true;
+    for (uint8_t i = 1; i < seq; i++) if (!s[bytes + i]) { full = false; break; }
+    if (!full) break;
+    cols += w; bytes += seq;
+  }
+  if (outBytes) *outBytes = bytes;
+  return cols;
+}
+
 // Advertise as "Claude-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop picker. Name persists in
 // btName for the BLUETOOTH info page.
@@ -712,37 +755,84 @@ void drawInfo() {
 }
 
 
-// Greedy word-wrap into fixed-width rows. Continuation rows get a leading
-// space. Returns number of rows written.
-static uint8_t wrapInto(const char* in, char out[][24], uint8_t maxRows, uint8_t width) {
-  uint8_t row = 0, col = 0;
+// Row buffer width — enough for either 21 ASCII bytes (classic) or
+// ~10 CJK codepoints at 3 bytes each (S3 efontCN). Unified so the
+// signature doesn't need to change per board.
+#define WRAP_ROW_BYTES 32
+
+// Greedy word-wrap by visual columns. ASCII counts as 1 column, multibyte
+// UTF-8 codepoints count as 2 (CJK is full-width in efontCN). Words break
+// on spaces when possible; a word that alone exceeds the width is
+// hard-broken at codepoint boundaries (not in the middle of a UTF-8
+// sequence — that was the pre-UTF-8-aware byte-wrap bug). Continuation
+// rows get a leading space indent so the original look survives.
+static uint8_t wrapInto(const char* in, char out[][WRAP_ROW_BYTES], uint8_t maxRows, uint8_t width) {
+  // Inline UTF-8 "next codepoint" scanner — returns the byte length and
+  // display-column width of the codepoint starting at s, or (0,0) at EOS.
+  auto nextCp = [](const char* s, uint8_t* seq, uint8_t* cols) {
+    uint8_t b = (uint8_t)*s;
+    if (!b)             { *seq = 0; *cols = 0; return; }
+    if (b < 0x80)       { *seq = 1; *cols = 1; return; }
+    if (b < 0xC0)       { *seq = 1; *cols = 1; return; }  // stray continuation
+    if (b < 0xE0)       { *seq = 2; *cols = 2; return; }
+    if (b < 0xF0)       { *seq = 3; *cols = 2; return; }
+                          *seq = 4; *cols = 2;
+  };
+
+  uint8_t row = 0, col = 0, byteCol = 0;  // col = visual cols, byteCol = bytes written to row
   const char* p = in;
   while (*p && row < maxRows) {
-    while (*p == ' ') p++;                     // skip leading spaces
-    // measure next word
+    while (*p == ' ') p++;                              // skip leading spaces
     const char* w = p;
-    while (*p && *p != ' ') p++;
-    uint8_t wlen = p - w;
-    if (wlen == 0) break;
-    uint8_t need = (col > 0 ? 1 : 0) + wlen;
-    if (col + need > width) {
-      out[row][col] = 0;
-      if (++row >= maxRows) return row;
-      out[row][0] = ' '; col = 1;              // continuation indent
+    // Measure next "word" (run of non-space bytes) in both bytes and cols.
+    uint16_t wordBytes = 0, wordCols = 0;
+    while (*p && *p != ' ') {
+      uint8_t seq, w2;
+      nextCp(p, &seq, &w2);
+      wordBytes += seq; wordCols += w2; p += seq;
     }
-    if (col > 1 || (col == 1 && out[row][0] != ' ')) out[row][col++] = ' ';
-    else if (col == 1 && row > 0) {}           // already have the indent space
-    // hard-break words that still don't fit
-    while (wlen > width - col) {
-      uint8_t take = width - col;
-      memcpy(&out[row][col], w, take); col += take; w += take; wlen -= take;
-      out[row][col] = 0;
+    if (wordBytes == 0) break;
+
+    uint8_t spaceCost = (col > 0 ? 1 : 0);
+    if (col + spaceCost + wordCols > width) {
+      out[row][byteCol] = 0;
       if (++row >= maxRows) return row;
-      out[row][0] = ' '; col = 1;
+      out[row][0] = ' '; col = 1; byteCol = 1;          // continuation indent
     }
-    memcpy(&out[row][col], w, wlen); col += wlen;
+    if (col > 1 || (col == 1 && out[row][0] != ' ')) {
+      out[row][byteCol++] = ' '; col++;
+    }
+
+    // Hard-break long words at codepoint boundaries.
+    const char* wp = w;
+    while (wordCols > width - col) {
+      uint16_t takeCols = width - col;
+      uint16_t takeBytes = 0;
+      while (takeCols > 0) {
+        uint8_t seq, w2;
+        nextCp(wp + takeBytes, &seq, &w2);
+        if (seq == 0 || w2 > takeCols) break;
+        takeBytes += seq; takeCols -= w2;
+      }
+      if (takeBytes == 0) break;                        // can't even fit 1 cp; bail
+      memcpy(&out[row][byteCol], wp, takeBytes);
+      byteCol += takeBytes; col += (width - col) - takeCols;
+      wp += takeBytes; wordBytes -= takeBytes;
+      // recount remaining cols
+      wordCols = 0;
+      for (uint16_t i = 0; i < wordBytes; ) {
+        uint8_t seq, w2; nextCp(wp + i, &seq, &w2);
+        if (seq == 0) break;
+        wordCols += w2; i += seq;
+      }
+      out[row][byteCol] = 0;
+      if (++row >= maxRows) return row;
+      out[row][0] = ' '; col = 1; byteCol = 1;
+    }
+    memcpy(&out[row][byteCol], wp, wordBytes);
+    byteCol += wordBytes; col += wordCols;
   }
-  if (col > 0 && row < maxRows) { out[row][col] = 0; row++; }
+  if (byteCol > 0 && row < maxRows) { out[row][byteCol] = 0; row++; }
   return row;
 }
 
@@ -759,23 +849,37 @@ static void drawApproval() {
   if (waited >= 10) spr.setTextColor(HOT, p.bg);
   spr.printf("approve? %lus", (unsigned long)waited);
 
-  // Size 2 only if it fits one line (~10 chars at 12px on 135px screen)
-  int toolLen = strlen(tama.promptTool);
+  // Tool name: size 2 only if it visually fits one line. promptTool may
+  // be CJK, so measure by visual columns (1 per ASCII, 2 per multibyte
+  // codepoint) instead of raw byte length.
+  uint16_t toolCols = utf8TakeCols(tama.promptTool, 0xFFFF, nullptr);
   spr.setTextColor(p.text, p.bg);
-  spr.setTextSize(toolLen <= 10 ? 2 : 1);
-  spr.setCursor(4, H - AREA + (toolLen <= 10 ? 14 : 18));
+  spr.setTextSize(toolCols <= 10 ? 2 : 1);
+  spr.setCursor(4, H - AREA + (toolCols <= 10 ? 14 : 18));
+  useCjkFont();
   spr.print(tama.promptTool);
+  useAsciiFont();
   spr.setTextSize(1);
 
-  // Hint wraps at ~21 chars to two lines under the tool name
+  // Hint wraps to two ~21-column lines. Slice on codepoint boundaries so
+  // a CJK character is never chopped mid-byte-sequence.
   spr.setTextColor(p.textDim, p.bg);
-  int hlen = strlen(tama.promptHint);
+  uint16_t line1Bytes = 0;
+  utf8TakeCols(tama.promptHint, 21, &line1Bytes);
+  char line1[32];
+  uint16_t copyBytes = line1Bytes < sizeof(line1) - 1 ? line1Bytes : sizeof(line1) - 1;
+  memcpy(line1, tama.promptHint, copyBytes);
+  line1[copyBytes] = 0;
+
   spr.setCursor(4, H - AREA + 34);
-  spr.printf("%.21s", tama.promptHint);
-  if (hlen > 21) {
+  useCjkFont();
+  spr.print(line1);
+  if (tama.promptHint[line1Bytes]) {
     spr.setCursor(4, H - AREA + 42);
-    spr.printf("%.21s", tama.promptHint + 21);
+    // The rest (truncated to 21 cols by drawing width; overflow clips).
+    spr.print(tama.promptHint + line1Bytes);
   }
+  useAsciiFont();
 
   if (responseSent) {
     spr.setTextColor(p.textDim, p.bg);
@@ -901,11 +1005,14 @@ void drawPet() {
   spr.setTextSize(1);
   spr.setTextColor(p.text, p.bg);
   spr.setCursor(4, y + 2);
+  // ownerName/petName may be Chinese — switch font for the title line.
+  useCjkFont();
   if (ownerName()[0]) {
     spr.printf("%s's %s", ownerName(), petName());
   } else {
     spr.print(petName());
   }
+  useAsciiFont();
   spr.setTextColor(p.textDim, p.bg);
   spr.setCursor(W - 28, y + 2);
   spr.printf("%u/%u", petPage + 1, PET_PAGES);
@@ -914,7 +1021,13 @@ void drawPet() {
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
   const Palette& p = characterPalette();
-  const int SHOW = 3, LH = 8, WIDTH = 21;
+  // On S3 with efontCN_14 the per-line height nearly doubles (14 vs 8),
+  // so give the transcript area more room and wrap to fewer visual cols.
+#ifdef BUDDY_BOARD_S3
+  const int SHOW = 3, LH = 15, WIDTH = 18;
+#else
+  const int SHOW = 3, LH = 8,  WIDTH = 21;
+#endif
   const int AREA = SHOW * LH + 4;
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
   spr.setTextSize(1);
@@ -924,13 +1037,16 @@ void drawHUD() {
   if (tama.nLines == 0) {
     spr.setTextColor(p.text, p.bg);
     spr.setCursor(4, H - LH - 2);
+    // tama.msg may contain CJK; switch font for the draw and restore.
+    useCjkFont();
     spr.print(tama.msg);
+    useAsciiFont();
     return;
   }
 
   // Wrap all transcript lines into a flat display buffer. Track which
   // transcript index each display row came from, so we can dim older ones.
-  static char disp[32][24];
+  static char disp[32][WRAP_ROW_BYTES];
   static uint8_t srcOf[32];
   uint8_t nDisp = 0;
   for (uint8_t i = 0; i < tama.nLines && nDisp < 32; i++) {
@@ -945,6 +1061,7 @@ void drawHUD() {
   int end = (int)nDisp - msgScroll;
   int start = end - SHOW; if (start < 0) start = 0;
   uint8_t newest = tama.nLines - 1;
+  useCjkFont();
   for (int i = 0; start + i < end; i++) {
     uint8_t row = start + i;
     bool fresh = (srcOf[row] == newest) && (msgScroll == 0);
@@ -952,6 +1069,7 @@ void drawHUD() {
     spr.setCursor(4, H - AREA + 2 + i * LH);
     spr.print(disp[row]);
   }
+  useAsciiFont();
   if (msgScroll > 0) {
     spr.setTextColor(p.body, p.bg);
     spr.setCursor(W - 18, H - LH - 2);
@@ -1004,8 +1122,10 @@ void setup() {
     if (ownerName()[0]) {
       char line[40];
       snprintf(line, sizeof(line), "%s's", ownerName());
+      useCjkFont();
       spr.setTextColor(p.text, p.bg);   spr.drawString(line, W/2, H/2 - 12);
       spr.setTextColor(p.body, p.bg);   spr.drawString(petName(), W/2, H/2 + 12);
+      useAsciiFont();
     } else {
       // First boot, no owner pushed yet — say hi.
       spr.setTextColor(p.body, p.bg);   spr.drawString("Hello!", W/2, H/2 - 12);
