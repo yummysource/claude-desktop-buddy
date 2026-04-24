@@ -78,11 +78,7 @@ static void _applyJson(const char* line, TamaState* out) {
   if (!t.isNull() && t.size() == 2) {
     time_t local = (time_t)t[0].as<uint32_t>() + (int32_t)t[1];
     struct tm lt; gmtime_r(&local, &lt);
-    RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
-    RTC_DateTypeDef dt = { (uint8_t)lt.tm_wday, (uint8_t)(lt.tm_mon + 1),
-                           (uint8_t)lt.tm_mday, (uint16_t)(lt.tm_year + 1900) };
-    M5.Rtc.SetTime(&tm);
-    M5.Rtc.SetDate(&dt);
+    M5.Rtc.setDateTime(&lt);
     extern uint32_t _clkLastRead;
     _clkLastRead = 0;   // force re-read so _clkDt and _rtcValid agree
     _rtcValid = true;
@@ -157,7 +153,13 @@ inline void dataPoll(TamaState* out) {
     return;
   }
 
+#ifndef BUDDY_BOARD_S3
+  // Original StickC Plus: Serial goes through the AXP192 UART bridge and
+  // is a reliable command channel. StickS3 native USB CDC reports phantom
+  // bytes in Serial.available() when no host is attached, so we skip it
+  // there — BLE is the primary transport anyway.
   _usbLine.feed(Serial, out);
+#endif
   // BLE ring buffer is drained manually since it's not a Stream.
   while (bleAvailable()) {
     int c = bleRead();

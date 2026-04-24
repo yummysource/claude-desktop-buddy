@@ -24,7 +24,9 @@ void characterClose();   // close GIF + clear loaded flag; FS stays mounted   //
 // header strip; off renders full-size centered in the upper home area.
 // Adaptive to actual canvas height — no padding required in source art.
 void characterSetPeek(bool peek);
-class TFT_eSPI;
-void characterRenderTo(TFT_eSPI* tgt, int cx, int cy);
+// LovyanGFX is a `using` alias (not a class name), so we need the full
+// header to use it as a pointer type in a signature.
+#include <M5Unified.h>
+void characterRenderTo(LovyanGFX* tgt, int cx, int cy);
 
 const Palette& characterPalette();

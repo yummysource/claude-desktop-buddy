@@ -8,8 +8,10 @@
 void buddyInit();
 void buddyTick(uint8_t personaState);
 void buddyInvalidate();
-class TFT_eSPI;
-void buddyRenderTo(TFT_eSPI* tgt, uint8_t personaState);
+// LovyanGFX is a `using` alias (not a class name), so we need the full
+// header to use it as a pointer type in a signature.
+#include <M5Unified.h>
+void buddyRenderTo(LovyanGFX* tgt, uint8_t personaState);
 void buddySetSpecies(const char* name);
 void buddySetSpeciesIdx(uint8_t idx);
 void buddyNextSpecies();
