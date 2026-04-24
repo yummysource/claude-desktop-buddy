@@ -1032,7 +1032,11 @@ void drawHUD() {
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
   spr.setTextSize(1);
 
-  if (tama.lineGen != lastLineGen) { msgScroll = 0; lastLineGen = tama.lineGen; wake(); }
+  // On new content, jump to the TOP of the transcript so the user can
+  // read the message front-to-back. msgScroll is "rows back from newest";
+  // clamp just below picks up maxBack once we know it. Using 0xFF as a
+  // sentinel keeps the logic cheap here before wrapping has happened.
+  if (tama.lineGen != lastLineGen) { msgScroll = 0xFF; lastLineGen = tama.lineGen; wake(); }
 
   if (tama.nLines == 0) {
     spr.setTextColor(p.text, p.bg);
@@ -1298,7 +1302,15 @@ void loop() {
       applyDisplayMode();
     } else {
       beep(2400, 30);
-      msgScroll = (msgScroll >= 30) ? 0 : msgScroll + 1;
+      // Transcript reads top-to-bottom: new content lands us at the oldest
+      // row (msgScroll = maxBack, set via the 0xFF sentinel in drawHUD),
+      // and each B press pages DOWN toward the newest. When we hit the
+      // newest (msgScroll == 0), the next press wraps back to the top.
+      // Keep this in sync with SHOW in drawHUD — it's the page size.
+      const uint8_t MSG_PAGE = 3;
+      if (msgScroll == 0)                 msgScroll = 0xFF;      // wrap to top
+      else if (msgScroll > MSG_PAGE)      msgScroll -= MSG_PAGE;
+      else                                msgScroll = 0;         // land on newest
     }
   }
 
