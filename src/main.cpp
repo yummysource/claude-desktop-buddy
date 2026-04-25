@@ -17,6 +17,9 @@ M5Canvas spr = M5Canvas(&M5.Lcd);
 // partition, so these helpers are no-ops there — Chinese still won't
 // render on the classic board.
 #ifdef BUDDY_BOARD_S3
+// efontCN_14 (14px tall) reads comfortably; pairs with 4 transcript
+// lines (LH=15, AREA=64), leaves 13px gap above the ASCII pet's clear
+// region so neither side gets chopped.
 static inline void useCjkFont()   { spr.setFont(&fonts::efontCN_14); }
 static inline void useAsciiFont() { spr.setFont(&fonts::Font0);       }
 #else
@@ -1021,10 +1024,13 @@ void drawPet() {
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
   const Palette& p = characterPalette();
-  // On S3 with efontCN_14 the per-line height nearly doubles (14 vs 8),
-  // so give the transcript area more room and wrap to fewer visual cols.
+  // S3 uses efontCN_14 (14px tall): 4 lines × LH=15 + 4 = 64px, transcript
+  // top at y=176 — 13px clear of the ASCII pet's 164px redraw zone and
+  // well above the GIF (max y=140). WIDTH=18 visual columns (ASCII=1,
+  // CJK=2) fits ~9 CJK characters across the 135px screen.
+  // Classic StickC Plus keeps the original GLCD-tuned 3-line layout.
 #ifdef BUDDY_BOARD_S3
-  const int SHOW = 3, LH = 15, WIDTH = 18;
+  const int SHOW = 4, LH = 15, WIDTH = 18;
 #else
   const int SHOW = 3, LH = 8,  WIDTH = 21;
 #endif
@@ -1307,7 +1313,11 @@ void loop() {
       // and each B press pages DOWN toward the newest. When we hit the
       // newest (msgScroll == 0), the next press wraps back to the top.
       // Keep this in sync with SHOW in drawHUD — it's the page size.
+#ifdef BUDDY_BOARD_S3
+      const uint8_t MSG_PAGE = 4;
+#else
       const uint8_t MSG_PAGE = 3;
+#endif
       if (msgScroll == 0)                 msgScroll = 0xFF;      // wrap to top
       else if (msgScroll > MSG_PAGE)      msgScroll -= MSG_PAGE;
       else                                msgScroll = 0;         // land on newest
