@@ -169,6 +169,48 @@ static void beep(uint16_t freq, uint16_t dur) {
   if (settings().sound) M5.Speaker.tone(freq, dur);
 }
 
+// ─── Alert melodies ────────────────────────────────────────────────────
+// Five tunes for the prompt-arrival "approval pending" alert. Each note
+// is (frequency Hz, duration ms, gap-before-next-note ms). End-of-tune
+// is marked by freq==0. Gated by settings().sound; tune index is
+// settings().alertTune (0..4), exposed in the menu as "alert: 1/5".
+struct AlertNote { uint16_t freq; uint16_t dur; uint16_t gap; };
+static const AlertNote MELODY_CHIRP[]  = { {1200,  80, 0},                                  {0,0,0} };
+static const AlertNote MELODY_RISE[]   = { { 800,  60, 30}, {1000,  60, 30}, {1300, 100, 0},{0,0,0} };
+static const AlertNote MELODY_ALARM[]  = { {1500,  80, 50}, {1000,  80, 50}, {1500,  80, 0},{0,0,0} };
+static const AlertNote MELODY_FALL[]   = { {1800,  60, 25}, {1400,  60, 25}, {1000, 100, 0},{0,0,0} };
+static const AlertNote MELODY_DING[]   = { {1760, 200,  0},                                 {0,0,0} };
+static const AlertNote* const MELODIES[] = {
+  MELODY_CHIRP, MELODY_RISE, MELODY_ALARM, MELODY_FALL, MELODY_DING
+};
+static const char* const MELODY_NAMES[] = { "chirp", "rise", "alarm", "fall", "ding" };
+static const uint8_t N_MELODIES = sizeof(MELODIES) / sizeof(MELODIES[0]);
+
+// State machine: index, step, when-to-fire-next. The pump runs once per
+// loop iteration in tickAlertMelody().
+static const AlertNote* _melCur = nullptr;
+static uint8_t          _melStep = 0;
+static uint32_t         _melNextAt = 0;
+
+static void playAlert(uint8_t idx) {
+  if (!settings().sound) return;
+  if (idx >= N_MELODIES) idx = 0;
+  _melCur   = MELODIES[idx];
+  _melStep  = 0;
+  _melNextAt = millis();   // fire first note immediately on next pump
+}
+
+static void tickAlertMelody() {
+  if (!_melCur) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - _melNextAt) < 0) return;
+  const AlertNote& n = _melCur[_melStep];
+  if (n.freq == 0) { _melCur = nullptr; return; }
+  M5.Speaker.tone(n.freq, n.dur);
+  _melNextAt = now + n.dur + n.gap;
+  _melStep++;
+}
+
 static void sendCmd(const char* json) {
   Serial.println(json);
   size_t n = strlen(json);
@@ -196,8 +238,8 @@ const uint8_t MENU_N = 6;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
-const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
-const uint8_t SETTINGS_N = 10;
+const char* settingsItems[] = { "brightness", "sound", "alert", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
+const uint8_t SETTINGS_N = 11;
 
 bool    resetOpen = false;
 uint8_t resetSel  = 0;
@@ -215,19 +257,24 @@ static void applySetting(uint8_t idx) {
       return;
     case 1: s.sound = !s.sound; break;
     case 2:
+      // Cycle through alert melodies and play the new one as a preview.
+      s.alertTune = (s.alertTune + 1) % N_MELODIES;
+      playAlert(s.alertTune);
+      break;
+    case 3:
       // BT toggle is a stored preference only — BLE stays live. Turning
       // BLE off cleanly would require tearing down the BLE stack which
       // the Arduino BLE library doesn't do reliably. If we need a
       // hard-off someday, stop advertising via BLEDevice::getAdvertising().
       s.bt = !s.bt;
       break;
-    case 3: s.wifi = !s.wifi; break;   // stored only — no WiFi stack linked
-    case 4: s.led = !s.led; break;
-    case 5: s.hud = !s.hud; break;
-    case 6: s.clockRot = (s.clockRot + 1) % 3; break;
-    case 7: nextPet(); return;
-    case 8: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-    case 9: settingsOpen = false; characterInvalidate(); return;
+    case 4: s.wifi = !s.wifi; break;   // stored only — no WiFi stack linked
+    case 5: s.led = !s.led; break;
+    case 6: s.hud = !s.hud; break;
+    case 7: s.clockRot = (s.clockRot + 1) % 3; break;
+    case 8: nextPet(); return;
+    case 9: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+    case 10: settingsOpen = false; characterInvalidate(); return;
   }
   settingsSave();
 }
@@ -313,7 +360,6 @@ static void drawSettings() {
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
   spr.setTextSize(1);
   Settings& s = settings();
-  bool vals[] = { s.sound, s.bt, s.wifi, s.led, s.hud };
   for (int i = 0; i < SETTINGS_N; i++) {
     bool sel = (i == settingsSel);
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
@@ -322,18 +368,24 @@ static void drawSettings() {
     spr.print(settingsItems[i]);
     spr.setCursor(mx + mw - 36, my + 8 + i * 14);
     spr.setTextColor(p.textDim, PANEL);
-    if (i == 0) {
-      spr.printf("%u/4", brightLevel);
-    } else if (i >= 1 && i <= 5) {
-      spr.setTextColor(vals[i-1] ? GREEN : p.textDim, PANEL);
-      spr.print(vals[i-1] ? " on" : "off");
-    } else if (i == 6) {
-      static const char* const RN[] = { "auto", "port", "land" };
-      spr.print(RN[s.clockRot]);
-    } else if (i == 7) {
-      uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
-      uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
-      spr.printf("%u/%u", pos, total);
+    switch (i) {
+      case 0: spr.printf("%u/4", brightLevel); break;
+      case 1: spr.setTextColor(s.sound ? GREEN : p.textDim, PANEL);
+              spr.print(s.sound ? " on" : "off"); break;
+      case 2: spr.print(MELODY_NAMES[s.alertTune]); break;
+      case 3: spr.setTextColor(s.bt    ? GREEN : p.textDim, PANEL);
+              spr.print(s.bt    ? " on" : "off"); break;
+      case 4: spr.setTextColor(s.wifi  ? GREEN : p.textDim, PANEL);
+              spr.print(s.wifi  ? " on" : "off"); break;
+      case 5: spr.setTextColor(s.led   ? GREEN : p.textDim, PANEL);
+              spr.print(s.led   ? " on" : "off"); break;
+      case 6: spr.setTextColor(s.hud   ? GREEN : p.textDim, PANEL);
+              spr.print(s.hud   ? " on" : "off"); break;
+      case 7: { static const char* const RN[] = { "auto", "port", "land" };
+                spr.print(RN[s.clockRot]); } break;
+      case 8: { uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
+                uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
+                spr.printf("%u/%u", pos, total); } break;
     }
   }
   drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Change");
@@ -1153,6 +1205,7 @@ void setup() {
 
 void loop() {
   M5.update();
+  tickAlertMelody();
   t++;
   uint32_t now = millis();
 
@@ -1200,7 +1253,7 @@ void loop() {
     if (tama.promptId[0]) {
       promptArrivedMs = millis();
       wake();
-      beep(1200, 80);   // alert chirp
+      playAlert(settings().alertTune);   // user-selected melody
       // Jump to the approval screen no matter what was open — drawApproval
       // only runs from drawHUD which only runs in DISP_NORMAL.
       displayMode = DISP_NORMAL;

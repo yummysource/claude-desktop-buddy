@@ -183,9 +183,10 @@ struct Settings {
   bool led;
   bool hud;
   uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
+  uint8_t alertTune; // 0..4 — index into MELODIES table for prompt-arrival sound
 };
 
-static Settings _settings = { true, true, false, true, true, 0 };
+static Settings _settings = { true, true, false, true, true, 0, 0 };
 
 inline void settingsLoad() {
   _prefs.begin("buddy", true);
@@ -196,6 +197,8 @@ inline void settingsLoad() {
   _settings.hud      = _prefs.getBool("s_hud", true);
   _settings.clockRot = _prefs.getUChar("s_crot", 0);
   if (_settings.clockRot > 2) _settings.clockRot = 0;
+  _settings.alertTune = _prefs.getUChar("s_atune", 0);
+  if (_settings.alertTune > 4) _settings.alertTune = 0;
   _prefs.end();
 }
 
@@ -207,6 +210,7 @@ inline void settingsSave() {
   _prefs.putBool("s_led", _settings.led);
   _prefs.putBool("s_hud", _settings.hud);
   _prefs.putUChar("s_crot", _settings.clockRot);
+  _prefs.putUChar("s_atune", _settings.alertTune);
   _prefs.end();
 }
 
