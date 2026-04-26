@@ -34,6 +34,33 @@ static uint8_t stateRot[N_STATES];
 static uint8_t gifTotal = 0;
 static uint8_t curState = 0xFF;
 
+// Enumeration of all GIF characters present in /characters/. Refreshed
+// every characterInit() call. nextPet() reads charNames[] / charCount to
+// know how many GIF slots to cycle through, and uses characterSwitch()
+// to swap between them at runtime without re-running the LittleFS mount.
+static const uint8_t MAX_CHARS = 8;
+static char     charNames[MAX_CHARS][24];
+static uint8_t  charCount = 0;
+static char     curCharName[24] = "";
+
+static void enumerateCharacters() {
+  charCount = 0;
+  File d = LittleFS.open("/characters");
+  if (!d || !d.isDirectory()) { if (d) d.close(); return; }
+  File e;
+  while ((e = d.openNextFile()) && charCount < MAX_CHARS) {
+    if (e.isDirectory()) {
+      const char* n = strrchr(e.name(), '/');
+      const char* nm = n ? n + 1 : e.name();
+      strncpy(charNames[charCount], nm, sizeof(charNames[0]) - 1);
+      charNames[charCount][sizeof(charNames[0]) - 1] = 0;
+      charCount++;
+    }
+    e.close();
+  }
+  d.close();
+}
+
 static AnimatedGIF gif;
 static File        gifFile;
 static int         gifX = 0, gifY = 0, gifW = 0, gifH = 0;
@@ -56,6 +83,11 @@ static void gifPlace() {
 static uint32_t    nextFrameAt = 0;
 static uint32_t    animPauseUntil = 0;
 static uint32_t    variantStartedMs = 0;
+// Frames successfully decoded since the current GIF was opened. Used at
+// end-of-animation to tell a real multi-frame animation (loop it) from a
+// 1-frame static GIF like bufo's sleep (freeze it to avoid hammering
+// LittleFS / the GIF decoder with same-frame replays).
+static uint16_t    framesPlayed = 0;
 static const uint32_t VARIANT_DWELL_MS = 5000;
 static const uint32_t ANIM_PAUSE_MS    = 800;
 static bool        gifOpen = false;
@@ -146,27 +178,37 @@ bool characterInit(const char* name) {
     }
   }
 
-  // No name → scan /characters/ for the first directory present.
-  // Makes the boot character whatever you last installed.
-  static char scanned[24];
+  // Refresh the GIF character list every time we load. Cheap (one
+  // dir scan), and means a freshly-flashed pack shows up in the
+  // settings cycle without rebooting.
+  enumerateCharacters();
+
+  // No name → scan returned no directories, fall back. Otherwise pick
+  // first installed as default. Makes a clean install land on whatever
+  // was flashed.
   if (!name) {
-    File d = LittleFS.open("/characters");
-    if (d && d.isDirectory()) {
-      File e = d.openNextFile();
-      while (e) {
-        if (e.isDirectory()) {
-          const char* n = strrchr(e.name(), '/');
-          strncpy(scanned, n ? n + 1 : e.name(), sizeof(scanned) - 1);
-          scanned[sizeof(scanned) - 1] = 0;
-          name = scanned;
-          break;
-        }
-        e = d.openNextFile();
-      }
-      d.close();
+    if (charCount == 0) {
+      Serial.println("[char] no characters installed");
+      return false;
     }
-    if (!name) { Serial.println("[char] no characters installed"); return false; }
+    name = charNames[0];
+  } else {
+    // Validate name actually exists; if not, fall back to first installed.
+    bool found = false;
+    for (uint8_t i = 0; i < charCount; i++) {
+      if (strcmp(charNames[i], name) == 0) { found = true; break; }
+    }
+    if (!found) {
+      Serial.printf("[char] '%s' not found, using '%s'\n",
+                    name, charCount ? charNames[0] : "(none)");
+      if (charCount == 0) return false;
+      name = charNames[0];
+    }
   }
+
+  // Remember which GIF is loaded so nextPet() can find its index.
+  strncpy(curCharName, name, sizeof(curCharName) - 1);
+  curCharName[sizeof(curCharName) - 1] = 0;
 
   snprintf(basePath, sizeof(basePath), "/characters/%s", name);
   char mpath[64];
@@ -247,6 +289,20 @@ bool characterInit(const char* name) {
 bool characterLoaded() { return loaded; }
 const Palette& characterPalette() { return pal; }
 
+uint8_t characterCount() { return charCount; }
+const char* characterNameAt(uint8_t i) { return i < charCount ? charNames[i] : ""; }
+const char* characterCurrentName() { return curCharName; }
+
+bool characterSwitch(const char* name) {
+  if (!name || !*name) return false;
+  if (strcmp(name, curCharName) == 0 && loaded) return true;   // already loaded
+  // Tear down current GIF/state, then re-init from /characters/<name>.
+  // characterInit() refreshes the enumeration, validates name, reloads
+  // manifest + palette, and resets state machinery.
+  characterClose();
+  return characterInit(name);
+}
+
 // One-shot half-scale render to an arbitrary surface (M5.Lcd for the
 // landscape clock). Caller owns clearing. Advances frame timing so
 // animation runs even when characterTick() is bypassed.
@@ -323,6 +379,7 @@ void characterSetState(uint8_t s) {
     spr.fillSprite(pal.bg);   // bias upward, leave room for HUD
     nextFrameAt = 0;
     variantStartedMs = millis();
+    framesPlayed = 0;
     Serial.printf("[char] %s: %dx%d @ (%d,%d) heap=%u\n",
       gifPaths[idx], gifW, gifH, gifX, gifY, ESP.getFreeHeap());
   } else {
@@ -373,15 +430,26 @@ void characterTick() {
 
   int delayMs = 0;
   if (!gif.playFrame(false, &delayMs)) {
-    // End of animation. Single-gif states freeze on the last frame instead
-    // of reopening — the LittleFS open + GIF header decode is a multi-ms
-    // blocking burst, and during sleep state it was looping every ~4s,
-    // possibly starving the BT controller. The sprite already holds the
-    // last frame; just stop ticking. Multi-gif states (idle rotation)
-    // still advance after a brief pause.
+    // End of animation. Behavior splits three ways:
+    //   1. Single-frame static GIF (bufo's sleep) — freeze on last frame.
+    //      Repeatedly reopening the LittleFS file or even just resetting
+    //      a 1-frame GIF every ~100ms wastes CPU and was observed to
+    //      starve the BT controller during long sleep sessions.
+    //   2. Multi-frame single-file GIF (our capy-claude states) — loop
+    //      forever via gif.reset(). framesPlayed >= 2 means we actually
+    //      animated, so it's safe and intended to keep replaying.
+    //   3. Multi-variant state (bufo idle: 9 separate files) — keep
+    //      looping the current variant for VARIANT_DWELL_MS, then rotate.
+    bool isStatic = framesPlayed < 2;
     if (stateCount[curState] == 1) {
-      gif.close();
-      gifOpen = false;
+      if (isStatic) {
+        gif.close();
+        gifOpen = false;
+        return;
+      }
+      gif.reset();
+      framesPlayed = 0;
+      nextFrameAt = now;
       return;
     }
     // Multi-variant: loop the same GIF until the dwell window elapses, then
@@ -389,6 +457,7 @@ void characterTick() {
     // flash + 3s freeze.
     if (now - variantStartedMs < VARIANT_DWELL_MS) {
       gif.reset();
+      framesPlayed = 0;
       nextFrameAt = now;
       return;
     }
@@ -397,5 +466,6 @@ void characterTick() {
     animPauseUntil = now + ANIM_PAUSE_MS;
     return;
   }
+  framesPlayed++;
   nextFrameAt = now + (delayMs > 0 ? delayMs : 100);
 }

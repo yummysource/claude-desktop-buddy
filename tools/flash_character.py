@@ -23,16 +23,24 @@ def flash(src: Path) -> None:
     if total > CAP:
         sys.exit(f"{total:,} bytes — over the {CAP:,} LittleFS cap")
 
-    # uploadfs flashes everything under data/; the firmware only reads one
-    # character at a time, so a stale sibling just wastes partition space.
-    if DATA.exists():
-        shutil.rmtree(DATA)
+    # uploadfs flashes everything under data/. To allow multiple GIF
+    # characters to coexist on LittleFS (firmware now cycles through them
+    # via the settings menu), only replace the named character's folder
+    # and leave any siblings intact. Existing chars on the device stay
+    # because uploadfs syncs the cumulative data/ directory.
+    DATA.mkdir(parents=True, exist_ok=True)
     dst = DATA / name
+    if dst.exists():
+        shutil.rmtree(dst)
     shutil.copytree(src, dst)
+
+    siblings = sorted(p.name for p in DATA.iterdir() if p.is_dir() and p.name != name)
     print(f"staged {name}: {total:,} bytes -> {dst}")
+    if siblings:
+        print(f"keeping siblings: {', '.join(siblings)}")
 
     subprocess.run(["pio", "run", "-t", "uploadfs"], cwd=PROJECT, check=True)
-    print(f"\nflashed. on the stick: hold A -> settings -> species -> GIF")
+    print(f"\nflashed. on the stick: hold A -> settings -> ascii pet -> press B to cycle")
 
 
 if __name__ == "__main__":

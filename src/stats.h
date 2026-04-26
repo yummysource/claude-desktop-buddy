@@ -267,6 +267,31 @@ inline void speciesIdxSave(uint8_t idx) {
   _prefs.end();
 }
 
+// When species == SPECIES_GIF (0xFF) the firmware also reads this name to
+// pick which installed GIF character to render. Empty string means "no
+// preference, pick first available". Up to 23 chars + null.
+static char _gifName[24] = "";
+
+inline void gifNameLoad() {
+  _prefs.begin("buddy", true);
+  _prefs.getString("s_gifname", _gifName, sizeof(_gifName));
+  _prefs.end();
+}
+
+inline void gifNameSave(const char* name) {
+  size_t j = 0;
+  for (size_t i = 0; name && name[i] && j < sizeof(_gifName) - 1; i++) {
+    char c = name[i];
+    if (c >= 0x20 && c != '"' && c != '\\') _gifName[j++] = c;
+  }
+  _gifName[j] = 0;
+  _prefs.begin("buddy", false);
+  _prefs.putString("s_gifname", _gifName);
+  _prefs.end();
+}
+
+inline const char* gifName() { return _gifName; }
+
 inline Settings& settings() { return _settings; }
 
 inline const Stats& stats() { return _stats; }

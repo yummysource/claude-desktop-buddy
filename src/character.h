@@ -30,3 +30,10 @@ void characterSetPeek(bool peek);
 void characterRenderTo(LovyanGFX* tgt, int cx, int cy);
 
 const Palette& characterPalette();
+
+// --- Multi-character cycling (settings menu walks through all installed
+// GIF packs, not just the first one).
+uint8_t      characterCount();           // number of GIF packs in /characters/
+const char*  characterNameAt(uint8_t i); // name of the i-th pack (or "" if out of range)
+const char*  characterCurrentName();     // name of the currently loaded pack
+bool         characterSwitch(const char* name);  // close + load another pack at runtime

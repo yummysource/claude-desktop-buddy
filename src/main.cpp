@@ -120,17 +120,50 @@ const uint8_t SPECIES_GIF = 0xFF;   // species NVS sentinel: use the installed G
 
 // Cycle GIF (if installed) → ASCII species 0..N-1 → GIF. Persisted to the
 // existing "species" NVS key; 0xFF means GIF mode.
+// Cycle order: ASCII 0..N-1 → GIF 0..M-1 → ASCII 0 → ...
+//
+// We track position in a linear pet list. Position p maps to:
+//   p < N           → ASCII species p (buddyMode=true)
+//   N <= p < N+M    → GIF character at index (p - N) (buddyMode=false)
+// Persisted as either species byte (0..N-1 = ASCII) or species=0xFF +
+// gifName (which GIF). nextPet() walks forward and saves both fields
+// so a reboot lands on the same pet.
 static void nextPet() {
   uint8_t n = buddySpeciesCount();
-  if (!buddyMode) {                          // GIF → species 0
+  uint8_t m = characterCount();
+
+  // Find current position p in the combined list.
+  uint16_t p;
+  if (buddyMode) {
+    p = buddySpeciesIdx();                     // 0..N-1
+  } else {
+    p = n;                                     // default to first GIF if name unknown
+    const char* cur = characterCurrentName();
+    for (uint8_t i = 0; i < m; i++) {
+      if (strcmp(characterNameAt(i), cur) == 0) { p = n + i; break; }
+    }
+  }
+  uint16_t total = n + m;
+  if (total == 0) return;                      // no pets at all (shouldn't happen)
+  uint16_t next = (p + 1) % total;
+
+  if (next < n) {
+    // → ASCII species `next`
     buddyMode = true;
-    buddySetSpeciesIdx(0);
-    speciesIdxSave(0);
-  } else if (buddySpeciesIdx() + 1 >= n && gifAvailable) {  // last species → GIF
-    buddyMode = false;
-    speciesIdxSave(SPECIES_GIF);
-  } else {                                   // species i → species i+1
-    buddyNextSpecies();
+    buddySetSpeciesIdx((uint8_t)next);
+    speciesIdxSave((uint8_t)next);
+  } else {
+    // → GIF character `next - n`
+    uint8_t gifIdx = (uint8_t)(next - n);
+    const char* name = characterNameAt(gifIdx);
+    if (name && *name) {
+      characterSwitch(name);
+      gifNameSave(name);
+      speciesIdxSave(SPECIES_GIF);
+      gifAvailable = characterLoaded();
+      buddyMode = !gifAvailable;               // fall back to ASCII if load fails
+      if (!gifAvailable) buddySetSpeciesIdx(0);
+    }
   }
   characterInvalidate();
   if (buddyMode) buddyInvalidate();
@@ -383,9 +416,23 @@ static void drawSettings() {
               spr.print(s.hud   ? " on" : "off"); break;
       case 7: { static const char* const RN[] = { "auto", "port", "land" };
                 spr.print(RN[s.clockRot]); } break;
-      case 8: { uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
-                uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
-                spr.printf("%u/%u", pos, total); } break;
+      case 8: {
+                // Position in combined ASCII + GIF list. Multi-GIF aware:
+                // total = ASCII count + every installed GIF pack.
+                uint8_t n = buddySpeciesCount();
+                uint8_t m = characterCount();
+                uint8_t total = n + m;
+                uint8_t pos = 1;
+                if (buddyMode) {
+                  pos = buddySpeciesIdx() + 1;
+                } else {
+                  const char* cur = characterCurrentName();
+                  for (uint8_t k = 0; k < m; k++) {
+                    if (strcmp(characterNameAt(k), cur) == 0) { pos = n + k + 1; break; }
+                  }
+                }
+                spr.printf("%u/%u", pos, total);
+              } break;
     }
   }
   drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Change");
@@ -1164,11 +1211,17 @@ void setup() {
   statsLoad();
   settingsLoad();
   petNameLoad();
+  gifNameLoad();
   buddyInit();
 
   // BLE stays always-on; s.bt is stored as a preference only.
   spr.createSprite(W, H);
-  characterInit(nullptr);  // scan /characters/ for whatever is installed
+  // Boot character pick: when species == SPECIES_GIF and gifName() is set,
+  // load that specific GIF; otherwise let characterInit pick the first
+  // installed one. characterInit also enumerates ALL installed GIFs into
+  // a name list that nextPet() can later cycle through.
+  const char* bootGif = (speciesIdxLoad() == SPECIES_GIF && gifName()[0]) ? gifName() : nullptr;
+  characterInit(bootGif);
   gifAvailable = characterLoaded();
   // species NVS: 0..N-1 = ASCII species, 0xFF = use GIF (also the default,
   // so a fresh install lands on the GIF). With no GIF installed, 0xFF falls
