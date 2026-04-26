@@ -5,8 +5,12 @@ Faster than the BLE drop target when you're iterating on a character.
 
 Usage:
   python3 tools/flash_character.py characters/bufo
+  python3 tools/flash_character.py characters/bufo --env m5stickc-plus
+
+Defaults to the StickS3 env (m5sticks3) since that's what's actually
+plugged in for most development. Pass --env to target the classic board.
 """
-import json, sys, shutil, subprocess
+import argparse, json, shutil, subprocess, sys
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent
@@ -14,7 +18,7 @@ DATA    = PROJECT / "data" / "characters"
 CAP     = 1_800_000
 
 
-def flash(src: Path) -> None:
+def flash(src: Path, env: str) -> None:
     if not (src / "manifest.json").exists():
         sys.exit(f"no manifest.json in {src} — run tools/prep_character.py first")
     name = json.loads((src / "manifest.json").read_text())["name"]
@@ -39,11 +43,14 @@ def flash(src: Path) -> None:
     if siblings:
         print(f"keeping siblings: {', '.join(siblings)}")
 
-    subprocess.run(["pio", "run", "-t", "uploadfs"], cwd=PROJECT, check=True)
-    print(f"\nflashed. on the stick: hold A -> settings -> ascii pet -> press B to cycle")
+    subprocess.run(["pio", "run", "-e", env, "-t", "uploadfs"], cwd=PROJECT, check=True)
+    print(f"\nflashed via env {env}. on the stick: hold A -> settings -> ascii pet -> press B to cycle")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit(__doc__)
-    flash(Path(sys.argv[1]).resolve())
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("src", help="character folder, e.g. characters/bufo")
+    p.add_argument("--env", default="m5sticks3",
+                   help="PlatformIO env to flash (default: m5sticks3; use m5stickc-plus for classic)")
+    args = p.parse_args()
+    flash(Path(args.src).resolve(), args.env)

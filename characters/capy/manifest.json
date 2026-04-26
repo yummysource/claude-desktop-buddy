@@ -1,0 +1,19 @@
+{
+  "name": "capy",
+  "colors": {
+    "body": "#DA7756",
+    "bg": "#000000",
+    "text": "#F5E6D3",
+    "textDim": "#A8957D",
+    "ink": "#5A3E2B"
+  },
+  "states": {
+    "sleep": "sleep.gif",
+    "idle": "idle.gif",
+    "busy": "busy.gif",
+    "attention": "attention.gif",
+    "celebrate": "celebrate.gif",
+    "dizzy": "dizzy.gif",
+    "heart": "heart.gif"
+  }
+}
